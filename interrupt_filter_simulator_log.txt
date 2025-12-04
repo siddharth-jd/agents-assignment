@@ -1,0 +1,38 @@
+
+--- Filler while speaking (ok) ---
+is_speaking: True
+  delivering final: okay
+  -> decision: IGNORE | reason: all_ignore | stt: 'okay'
+  returned: IGNORE
+
+--- Affirmation while silent (yeah) ---
+is_speaking: False
+  delivering final: yeah
+  -> decision: PASS | reason: silent_mode_pass | stt: 'yeah'
+  returned: PASS
+
+--- Interrupt while speaking (no stop) ---
+is_speaking: True
+  delivering final: no stop
+  -> decision: INTERRUPT | reason: command_word:no | stt: 'no stop'
+  returned: INTERRUPT
+
+--- Mixed while speaking (yeah wait a sec) ---
+is_speaking: True
+  delivering final: yeah wait a second
+  -> decision: INTERRUPT | reason: command_word:wait | stt: 'yeah wait a second'
+  returned: INTERRUPT
+
+--- Partial only (filler) then timeout ---
+is_speaking: True
+  partial: ye
+  partial: yeah
+  no final provided; waiting for timeout
+  -> decision: IGNORE | reason: timeout_all_ignore | stt: 'yeah'
+
+--- Partial only (command) then timeout ---
+is_speaking: True
+  partial: sto
+  partial: stop
+  no final provided; waiting for timeout
+  -> decision: INTERRUPT | reason: partial_command:stop | stt: 'stop'

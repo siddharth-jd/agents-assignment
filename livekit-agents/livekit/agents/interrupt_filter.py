@@ -1,113 +1,148 @@
 # livekit-agents/livekit/agents/interrupt_filter.py
-import asyncio
+"""
+InterruptFilter: decide IGNORE / INTERRUPT / PASS based on agent speaking state.
+Simple, deterministic, no external deps. Validation window waits briefly for STT final.
+"""
+
 import re
-import time
-from typing import Optional, List, Callable
+import threading
+from typing import Callable, List, Optional
 
-DEFAULT_IGNORE_WORDS = ["yeah", "ok", "hmm", "right", "uh-huh", "uhh", "uh"]
-DEFAULT_INTERRUPT_WORDS = ["wait", "stop", "no", "hold on", "cancel", "pause"]
+_DEFAULT_IGNORE = ['yeah', 'ok', 'hmm', 'right', 'uh-huh', 'uh', 'mm', 'mm-hmm', 'uh huh', 'okay']
+_DEFAULT_COMMANDS = ['stop', 'wait', 'no', 'pause', 'hold', 'start', 'cancel', 'hey', 'what', 'help', 'listen']
 
-_norm_re = re.compile(r"[^\w\s']+", flags=re.UNICODE)
-
-def normalize_text(s: str) -> str:
-    return _norm_re.sub("", s.strip().lower())
+def _norm_tokens(text: str) -> List[str]:
+    if not text:
+        return []
+    text = text.lower().strip()
+    return re.findall(r"[a-zA-Z']+", text)
 
 class InterruptFilter:
-    def __init__(
-        self,
-        ignore_words: Optional[List[str]] = None,
-        interrupt_words: Optional[List[str]] = None,
-        stt_timeout_ms: int = 200,
-        on_interrupt: Optional[Callable[[str], None]] = None,
-        on_ignore: Optional[Callable[[], None]] = None,
-    ):
-        self.ignore_set = set((ignore_words or DEFAULT_IGNORE_WORDS))
-        self.interrupt_set = set((interrupt_words or DEFAULT_INTERRUPT_WORDS))
-        self.stt_timeout_ms = stt_timeout_ms
-        self.on_interrupt = on_interrupt
-        self.on_ignore = on_ignore
+    """
+    Usage:
+      f = InterruptFilter(validation_window_ms=250, on_decision=callback)
+      f.set_speaking(True)
+      f.on_vad_start()
+      f.on_stt_partial("ye")
+      f.on_stt_final("yeah")
+    Callback signature: (decision, reason, stt_text)
+    Decisions: 'IGNORE','INTERRUPT','PASS'
+    """
+    def __init__(self,
+                 ignore_words: Optional[List[str]] = None,
+                 command_words: Optional[List[str]] = None,
+                 validation_window_ms: int = 250,
+                 on_decision: Optional[Callable[[str, str, str], None]] = None):
+        self.ignore_words = set(w.lower() for w in (ignore_words or _DEFAULT_IGNORE))
+        self.command_words = set(w.lower() for w in (command_words or _DEFAULT_COMMANDS))
+        self.validation_window_ms = max(50, int(validation_window_ms))
+        self.is_speaking = False
 
-        self.agent_speaking = False
-        self._candidate = None
-        self._lock = asyncio.Lock()
+        self._vad_pending = False
+        self._stt_buffer = ""
+        self._timer: Optional[threading.Timer] = None
+        self._lock = threading.Lock()
+        self.on_decision = on_decision
 
-    def set_agent_speaking(self, speaking: bool):
-        self.agent_speaking = bool(speaking)
+    def set_speaking(self, speaking: bool):
+        with self._lock:
+            self.is_speaking = bool(speaking)
 
-    async def on_vad_trigger(self):
-        if not self.agent_speaking:
-            return "PASS_THROUGH"
-
-        async with self._lock:
-            if self._candidate is not None:
-                return "ALREADY_PENDING"
-            self._candidate = {
-                "started_at": time.time(),
-                "partials": [],
-                "resolved": False
-            }
-
-        asyncio.create_task(self._resolve_candidate(self._candidate))
-        return "CANDIDATE_CREATED"
-
-    async def on_stt_partial(self, text: str, is_final: bool = False):
-        text_norm = normalize_text(text)
-        async with self._lock:
-            c = self._candidate
-            if c is None:
-                return "NORMAL_INPUT"
-            c["partials"].append((text, text_norm, is_final))
-        if is_final:
-            await self._resolve_candidate(c)
-            return "RESOLVED_FINAL"
-        return "PARTIAL_COLLECTED"
-
-    async def _resolve_candidate(self, candidate):
-        deadline = candidate["started_at"] + (self.stt_timeout_ms / 1000.0)
-        while True:
-            now = time.time()
-            partials = candidate["partials"]
-            if any(is_final for (_, _, is_final) in partials):
-                break
-            if now >= deadline:
-                break
-            await asyncio.sleep(0.02)
-
-        parts = [p for (_, p, _) in candidate["partials"] if p]
-        text_all = " ".join(parts).strip()
-        tokens = [t for t in text_all.split() if t]
-        has_interrupt = any(tok in self.interrupt_set for tok in tokens)
-        only_ignore = len(tokens) > 0 and all(tok in self.ignore_set for tok in tokens)
-
-        async with self._lock:
-            candidate["resolved"] = True
-            if self._candidate is candidate:
-                self._candidate = None
-
-        if has_interrupt:
-            if self.on_interrupt:
-                try:
-                    self.on_interrupt(text_all or "")
-                except Exception:
-                    pass
-            return "INTERRUPT"
-        if only_ignore:
-            if self.on_ignore:
-                try:
-                    self.on_ignore()
-                except Exception:
-                    pass
-            return "IGNORE"
-        if text_all == "":
-            if self.on_ignore:
-                try:
-                    self.on_ignore()
-                except Exception:
-                    pass
-            return "IGNORE"
-        if self.on_interrupt:
+    def _cancel_timer(self):
+        if self._timer:
             try:
-                self.on_interrupt(text_all)
+                self._timer.cancel()
             except Exception:
                 pass
-        return "INTERRUPT"
+            self._timer = None
+
+    def on_vad_start(self):
+        with self._lock:
+            self._vad_pending = True
+            self._stt_buffer = ""
+            self._cancel_timer()
+            self._timer = threading.Timer(self.validation_window_ms / 1000.0, self._on_vad_timeout_internal)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def on_stt_partial(self, text: str):
+        if text is None:
+            return
+        with self._lock:
+            self._stt_buffer = text.strip()
+
+    def on_stt_final(self, text: str) -> str:
+        if text is None:
+            text = ""
+        with self._lock:
+            self._cancel_timer()
+            self._vad_pending = False
+            self._stt_buffer = text.strip()
+            tokens = _norm_tokens(self._stt_buffer)
+            if not tokens:
+                decision = 'IGNORE' if self.is_speaking else 'PASS'
+                reason = 'empty_transcription'
+                self._maybe_callback(decision, reason, text)
+                return decision
+
+            for t in tokens:
+                if t in self.command_words:
+                    decision = 'INTERRUPT'
+                    reason = f'command_word:{t}'
+                    self._maybe_callback(decision, reason, text)
+                    return decision
+
+            all_ignore = all((t in self.ignore_words) for t in tokens)
+            if self.is_speaking:
+                decision = 'IGNORE' if all_ignore else 'INTERRUPT'
+                reason = 'all_ignore' if all_ignore else 'contains_non_ignore'
+            else:
+                decision = 'PASS'
+                reason = 'silent_mode_pass'
+            self._maybe_callback(decision, reason, text)
+            return decision
+
+    def _on_vad_timeout_internal(self):
+        with self._lock:
+            self._timer = None
+            if not self._vad_pending:
+                return
+            tokens = _norm_tokens(self._stt_buffer)
+            if not tokens:
+                decision = 'IGNORE' if self.is_speaking else 'PASS'
+                reason = 'timeout_empty_partial'
+                self._vad_pending = False
+                self._maybe_callback(decision, reason, self._stt_buffer)
+                return
+
+            for t in tokens:
+                if t in self.command_words:
+                    decision = 'INTERRUPT'
+                    reason = f'partial_command:{t}'
+                    self._vad_pending = False
+                    self._maybe_callback(decision, reason, self._stt_buffer)
+                    return
+
+            all_ignore = all((t in self.ignore_words) for t in tokens)
+            if self.is_speaking:
+                decision = 'IGNORE' if all_ignore else 'INTERRUPT'
+                reason = 'timeout_all_ignore' if all_ignore else 'timeout_contains_non_ignore'
+            else:
+                decision = 'PASS'
+                reason = 'timeout_silent_pass'
+            self._vad_pending = False
+            self._maybe_callback(decision, reason, self._stt_buffer)
+            return
+
+    def on_vad_cancel(self):
+        with self._lock:
+            self._cancel_timer()
+            self._vad_pending = False
+            self._stt_buffer = ""
+
+    def _maybe_callback(self, decision: str, reason: str, stt_text: str):
+        if callable(self.on_decision):
+            try:
+                self.on_decision(decision, reason, stt_text)
+            except Exception:
+                pass
